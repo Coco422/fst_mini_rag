@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>语音生成服务演示</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    <style>
+        :root {
+            --primary-color: #4361ee;
+            --secondary-color: #3f37c9;
+            --success-color: #4cc9f0;
+            --light-color: #f8f9fa;
+            --dark-color: #212529;
+        }
+        
+        body {
+            font-family: 'Roboto', 'Helvetica Neue', sans-serif;
+            background-color: #f5f7fb;
+            color: #333;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .container {
+            max-width: 800px;
+            margin: 30px auto;
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 15px;
+            border-radius: 8px;
+            background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+            color: white;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+        }
+        
+        .card {
+            border: none;
+            border-radius: 12px;
+            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.05);
+            transition: all 0.3s ease;
+            margin-bottom: 20px;
+        }
+        
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1);
+        }
+        
+        .card-header {
+            background-color: var(--light-color);
+            border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+            font-weight: 600;
+            padding: 15px 20px;
+            border-radius: 12px 12px 0 0 !important;
+        }
+        
+        .card-body {
+            padding: 20px;
+        }
+        
+        .form-control {
+            border-radius: 8px;
+            padding: 12px 15px;
+            border: 1px solid #ddd;
+            transition: all 0.3s ease;
+        }
+        
+        .form-control:focus {
+            box-shadow: 0 0 0 0.25rem rgba(67, 97, 238, 0.15);
+            border-color: var(--primary-color);
+        }
+        
+        .btn {
+            border-radius: 8px;
+            padding: 10px 20px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+        
+        .btn-primary {
+            background-color: var(--primary-color);
+            border-color: var(--primary-color);
+        }
+        
+        .btn-primary:hover {
+            background-color: var(--secondary-color);
+            border-color: var(--secondary-color);
+        }
+        
+        .btn-danger {
+            background-color: #ef476f;
+            border-color: #ef476f;
+        }
+        
+        .btn-danger:hover {
+            background-color: #d64161;
+            border-color: #d64161;
+        }
+        
+        textarea {
+            resize: none;
+            min-height: 120px;
+        }
+        
+        .status-box {
+            background-color: #edf2fb;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+            display: none;
+        }
+        
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .status-indicator .icon {
+            margin-right: 10px;
+            font-size: 20px;
+        }
+        
+        .audio-player {
+            margin-top: 15px;
+            display: none;
+        }
+        
+        .loading-spinner {
+            width: 20px;
+            height: 20px;
+            margin-right: 10px;
+            border: 2px solid #f3f3f3;
+            border-top: 2px solid var(--primary-color);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .audio-log {
+            max-height: 200px;
+            overflow-y: auto;
+            margin-top: 15px;
+            padding: 10px;
+            background-color: var(--light-color);
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 14px;
+            color: var(--dark-color);
+        }
+        
+        .log-entry {
+            margin-bottom: 5px;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 5px;
+        }
+        
+        footer {
+            text-align: center;
+            padding: 20px;
+            color: #6c757d;
+            margin-top: auto;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1><i class="bi bi-soundwave"></i> 语音生成服务</h1>
+            <p class="mb-0">实时将 LLM 输出转换为流式语音输出</p>
+        </div>
+        
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-chat-dots"></i> 输入要询问 LLM 的文本
+            </div>
+            <div class="card-body">
+                <form id="queryForm">
+                    <div class="mb-3">
+                        <textarea class="form-control" id="questionInput" placeholder="请输入您想要询问 LLM 的文本..." required></textarea>
+                    </div>
+                    <div class="d-grid gap-2">
+                        <button type="submit" class="btn btn-primary" id="submitBtn">
+                            <i class="bi bi-play-fill"></i> 开始生成语音
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        
+        <div class="status-box" id="statusBox">
+            <div class="status-indicator">
+                <div class="loading-spinner" id="statusSpinner"></div>
+                <span id="statusText">正在处理...</span>
+            </div>
+            
+            <div class="progress mb-3">
+                <div class="progress-bar bg-primary" id="progressBar" role="progressbar" style="width: 0%;" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">0%</div>
+            </div>
+            
+            <div class="d-flex justify-content-between">
+                <button class="btn btn-sm btn-danger" id="cancelBtn">
+                    <i class="bi bi-x-circle"></i> 取消任务
+                </button>
+                <span id="segmentCounter">已获取: 0 个音频片段</span>
+            </div>
+        </div>
+        
+        <div class="audio-player" id="audioPlayer">
+            <div class="card">
+                <div class="card-header">
+                    <i class="bi bi-speaker"></i> 语音播放
+                </div>
+                <div class="card-body">
+                    <div id="audioControls" class="mb-3">
+                        <button class="btn btn-sm btn-primary me-2" id="playAllBtn">
+                            <i class="bi bi-play-fill"></i> 播放全部
+                        </button>
+                        <button class="btn btn-sm btn-secondary me-2" id="pauseBtn">
+                            <i class="bi bi-pause-fill"></i> 暂停
+                        </button>
+                        <button class="btn btn-sm btn-primary" id="resumeBtn">
+                            <i class="bi bi-play-fill"></i> 继续播放
+                        </button>
+                    </div>
+                    <div>当前播放: <span id="currentPlayingText">无</span></div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mt-3">
+            <div class="card-header">
+                <i class="bi bi-list-ul"></i> 处理日志
+            </div>
+            <div class="card-body">
+                <div class="audio-log" id="audioLog">
+                    <div class="log-entry">等待开始处理...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <footer>
+        <p>Mini RAG TTS - 流式语音生成服务 © 2023</p>
+    </footer>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // 页面元素
+            const queryForm = document.getElementById('queryForm');
+            const questionInput = document.getElementById('questionInput');
+            const submitBtn = document.getElementById('submitBtn');
+            const cancelBtn = document.getElementById('cancelBtn');
+            const statusBox = document.getElementById('statusBox');
+            const statusText = document.getElementById('statusText');
+            const statusSpinner = document.getElementById('statusSpinner');
+            const progressBar = document.getElementById('progressBar');
+            const segmentCounter = document.getElementById('segmentCounter');
+            const audioPlayer = document.getElementById('audioPlayer');
+            const audioLog = document.getElementById('audioLog');
+            const playAllBtn = document.getElementById('playAllBtn');
+            const pauseBtn = document.getElementById('pauseBtn');
+            const resumeBtn = document.getElementById('resumeBtn');
+            const currentPlayingText = document.getElementById('currentPlayingText');
+            
+            // 任务状态
+            let currentTaskId = null;
+            let audioSegments = [];
+            let audioIndex = 0;
+            let isPlaying = false;
+            let isPaused = false;
+            let audioQueue = [];
+            let currentAudio = null;
+            
+            // 日志函数
+            function addLog(message) {
+                const logEntry = document.createElement('div');
+                logEntry.className = 'log-entry';
+                logEntry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+                audioLog.appendChild(logEntry);
+                audioLog.scrollTop = audioLog.scrollHeight;
+            }
+            
+            // 提交表单
+            queryForm.addEventListener('submit', async function(e) {
+                e.preventDefault();
+                
+                const question = questionInput.value.trim();
+                if (!question) return;
+                
+                // 重置状态
+                resetState();
+                
+                // 显示状态框
+                statusBox.style.display = 'block';
+                submitBtn.disabled = true;
+                
+                addLog(`开始处理: "${question.substring(0, 30)}${question.length > 30 ? '...' : ''}"`);
+                
+                try {
+                    // 调用API开始生成
+                    const response = await fetch('/generate_audio', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({ question })
+                    });
+                    
+                    const data = await response.json();
+                    currentTaskId = data.task_id;
+                    
+                    addLog(`任务已创建 [ID: ${currentTaskId}]`);
+                    
+                    // 开始获取音频片段
+                    fetchNextAudio();
+                } catch (error) {
+                    console.error('Error:', error);
+                    addLog(`错误: ${error.message}`);
+                    statusText.textContent = '处理失败';
+                    statusSpinner.style.display = 'none';
+                    submitBtn.disabled = false;
+                }
+            });
+            
+            // 获取下一个音频片段
+            async function fetchNextAudio() {
+                if (!currentTaskId) return;
+                
+                try {
+                    const response = await fetch(`/get_next_audio/${currentTaskId}`);
+                    
+                    // 检查是否是音频文件
+                    const contentType = response.headers.get('Content-Type');
+                    
+                    if (contentType && contentType.includes('audio')) {
+                        // 处理音频文件
+                        const blob = await response.blob();
+                        const audioUrl = URL.createObjectURL(blob);
+                        
+                        // 将音频添加到队列
+                        audioSegments.push(audioUrl);
+                        segmentCounter.textContent = `已获取: ${audioSegments.length} 个音频片段`;
+                        
+                        addLog(`已获取音频片段 #${audioSegments.length}`);
+                        
+                        // 如果是第一个音频片段，显示播放器
+                        if (audioSegments.length === 1) {
+                            audioPlayer.style.display = 'block';
+                            // 立即开始播放第一个片段
+                            playAudio();
+                        }
+                        
+                        // 更新进度条（模拟进度）
+                        updateProgress(audioSegments.length * 10);
+                        
+                        // 继续获取下一个片段
+                        fetchNextAudio();
+                    } else {
+                        // 不是音频文件，解析JSON响应
+                        const data = await response.json();
+                        
+                        if (data.status === 'completed') {
+                            // 所有片段已生成完毕
+                            statusText.textContent = '处理完成';
+                            statusSpinner.style.display = 'none';
+                            addLog('所有音频片段已生成完毕');
+                            updateProgress(100);
+                            submitBtn.disabled = false;
+                        } else if (data.status === 'pending') {
+                            // 正在处理中，稍后再试
+                            addLog('等待更多音频生成...');
+                            setTimeout(fetchNextAudio, 1000);
+                        } else {
+                            // 其他状态
+                            statusText.textContent = `未知状态: ${data.status}`;
+                            addLog(`未知状态: ${data.status}`);
+                            submitBtn.disabled = false;
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error:', error);
+                    addLog(`获取音频错误: ${error.message}`);
+                    statusText.textContent = '获取音频失败';
+                    submitBtn.disabled = false;
+                }
+            }
+            
+            // 播放音频
+            function playAudio() {
+                if (audioSegments.length === 0) return;
+                if (isPlaying) return; // 避免重复播放
+                
+                isPlaying = true;
+                audioIndex = audioIndex || 0; // 确保索引有效
+                
+                // 确保索引在有效范围内
+                if (audioIndex >= audioSegments.length) {
+                    audioIndex = 0;
+                }
+                
+                const audio = new Audio(audioSegments[audioIndex]);
+                currentAudio = audio;
+                
+                addLog(`开始播放片段 #${audioIndex + 1}`);
+                currentPlayingText.textContent = `片段 #${audioIndex + 1}`;
+                
+                // 添加调试信息
+                console.log(`播放片段 #${audioIndex + 1}，总片段数: ${audioSegments.length}`);
+                
+                audio.onended = function() {
+                    console.log(`片段 #${audioIndex + 1} 播放完毕`);
+                    addLog(`片段 #${audioIndex + 1} 播放完毕`);
+                    
+                    audioIndex++;
+                    isPlaying = false; // 重置播放状态，允许播放下一个
+                    
+                    if (audioIndex < audioSegments.length) {
+                        // 播放下一个片段
+                        addLog(`准备播放下一个片段 #${audioIndex + 1}`);
+                        setTimeout(playAudio, 50); // 添加小延迟以避免可能的问题
+                    } else {
+                        // 所有已获取的片段播放完毕
+                        currentPlayingText.textContent = '等待更多音频...';
+                        addLog('已播放所有当前可用片段，等待更多...');
+                        
+                        // 检查是否还有未播放的片段
+                        if (audioQueue.length > 0) {
+                            audioSegments.push(audioQueue.shift());
+                            setTimeout(playAudio, 50);
+                        }
+                    }
+                };
+                
+                // 添加错误处理
+                audio.onerror = function(e) {
+                    console.error('音频播放错误:', e);
+                    addLog(`片段 #${audioIndex + 1} 播放出错`);
+                    isPlaying = false;
+                    audioIndex++; // 尝试播放下一个
+                    if (audioIndex < audioSegments.length) {
+                        setTimeout(playAudio, 50);
+                    }
+                };
+                
+                // 开始播放
+                audio.play().catch(err => {
+                    console.error('播放失败:', err);
+                    addLog(`播放失败: ${err.message}`);
+                    isPlaying = false;
+                });
+            }
+            
+            // 播放所有按钮
+            playAllBtn.addEventListener('click', function() {
+                if (audioSegments.length === 0) return;
+                
+                audioIndex = 0;
+                isPaused = false;
+                
+                if (currentAudio) {
+                    currentAudio.pause();
+                }
+                
+                playAudio();
+            });
+            
+            // 暂停按钮
+            pauseBtn.addEventListener('click', function() {
+                if (!isPlaying || !currentAudio) return;
+                
+                currentAudio.pause();
+                isPaused = true;
+                isPlaying = false;
+                addLog('暂停播放');
+            });
+            
+            // 继续按钮
+            resumeBtn.addEventListener('click', function() {
+                if (!isPaused || !currentAudio) return;
+                
+                currentAudio.play();
+                isPaused = false;
+                isPlaying = true;
+                addLog('继续播放');
+            });
+            
+            // 取消任务
+            cancelBtn.addEventListener('click', async function() {
+                if (!currentTaskId) return;
+                
+                try {
+                    addLog('正在取消任务...');
+                    
+                    const response = await fetch('/cancel_task_by_id', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({ task_id: currentTaskId })
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.status === 'success') {
+                        addLog('任务已取消');
+                        statusText.textContent = '已取消';
+                        statusSpinner.style.display = 'none';
+                        submitBtn.disabled = false;
+                    } else {
+                        addLog(`取消任务失败: ${data.message}`);
+                    }
+                } catch (error) {
+                    console.error('Error:', error);
+                    addLog(`取消任务错误: ${error.message}`);
+                }
+            });
+            
+            // 更新进度条
+            function updateProgress(percent) {
+                if (percent > 100) percent = 100;
+                
+                progressBar.style.width = `${percent}%`;
+                progressBar.textContent = `${percent}%`;
+                progressBar.setAttribute('aria-valuenow', percent);
+            }
+            
+            // 重置状态
+            function resetState() {
+                currentTaskId = null;
+                audioSegments = [];
+                audioIndex = 0;
+                isPlaying = false;
+                isPaused = false;
+                audioQueue = [];
+                
+                if (currentAudio) {
+                    currentAudio.pause();
+                    currentAudio = null;
+                }
+                
+                statusText.textContent = '正在处理...';
+                statusSpinner.style.display = 'block';
+                progressBar.style.width = '0%';
+                progressBar.textContent = '0%';
+                progressBar.setAttribute('aria-valuenow', 0);
+                segmentCounter.textContent = '已获取: 0 个音频片段';
+                audioPlayer.style.display = 'none';
+                currentPlayingText.textContent = '无';
+                
+                // 清空日志，只保留初始消息
+                audioLog.innerHTML = '<div class="log-entry">等待开始处理...</div>';
+            }
+        });
+    </script>
+</body>
+</html> 

@@ -1,538 +1,440 @@
-import json
-from fastapi import FastAPI, BackgroundTasks
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 import asyncio
 import uuid
-import re
-import logging
-import time
-import traceback
-import hashlib
-from datetime import datetime
-from typing import Dict, List, Optional, Set
-from dotenv import load_dotenv
 import os
+import logging
+from typing import Dict, List, Optional, Set
+from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 import httpx
+import time
+import json
+import dotenv
+# 清空环境变量
+os.environ.clear()
+# 设置环境变量
+dotenv.load_dotenv()
 
-load_dotenv()
-# 设置详细日志格式
-LOG_FORMAT = '%(asctime)s [%(levelname)s] [%(name)s:%(lineno)d] - %(message)s'
+# 配置日志
 logging.basicConfig(
-    level=logging.INFO,
-    format=LOG_FORMAT,
-    datefmt='%Y-%m-%d %H:%M:%S'
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("logs/app.log")
+    ]
 )
-logger = logging.getLogger(__name__)
-# 创建文件处理器以将日志同时写入文件
-LOG_DIR = os.getenv("LOG_DIR", "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-log_file = os.path.join(LOG_DIR, f"app_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-file_handler = logging.FileHandler(log_file)
-file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-logging.getLogger().addHandler(file_handler)
-logger.info("======= 应用启动 =======")
-logger.info(f"日志文件路径: {log_file}")
+logger = logging.getLogger("mini_rag")
+
+# 配置项
+MIN_CHARS_FOR_TTS = 20  # 触发TTS的最小字符数
+AUDIO_FOLDER = "audio"  # 音频文件存储目录
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") 
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
+
+# 确保音频文件夹和静态文件夹存在
+os.makedirs(AUDIO_FOLDER, exist_ok=True)
+os.makedirs("static", exist_ok=True)
 
 app = FastAPI()
-# 配置共享卷的相关路径
-SHARED_VOLUME_PATH = os.getenv("SHARED_VOLUME_PATH", "/app/shared")
-AUDIO_DIR = os.getenv("AUDIO_DIR", "audio")
-AUDIO_PATH = os.path.join(SHARED_VOLUME_PATH, AUDIO_DIR)
-AUDIO_URL_PREFIX = os.getenv("AUDIO_URL_PREFIX", "/audio")
-# 任务清理配置（单位：秒）
-TASK_CLEANUP_DELAY = int(os.getenv("TASK_CLEANUP_DELAY", "300"))  # 默认5分钟后清理
-# 最大并发TTS请求数
-MAX_CONCURRENT_TTS = int(os.getenv("MAX_CONCURRENT_TTS", "5"))
-# TTS音频缓存大小限制
-MAX_TTS_CACHE_SIZE = int(os.getenv("MAX_TTS_CACHE_SIZE", "100"))
 
-# 记录环境配置
-logger.info(f"环境配置: SHARED_VOLUME_PATH={SHARED_VOLUME_PATH}")
-logger.info(f"环境配置: AUDIO_DIR={AUDIO_DIR}")
-logger.info(f"环境配置: AUDIO_PATH={AUDIO_PATH}")
-logger.info(f"环境配置: AUDIO_URL_PREFIX={AUDIO_URL_PREFIX}")
-logger.info(f"环境配置: TASK_CLEANUP_DELAY={TASK_CLEANUP_DELAY}秒")
-logger.info(f"环境配置: MAX_CONCURRENT_TTS={MAX_CONCURRENT_TTS}")
-logger.info(f"环境配置: MAX_TTS_CACHE_SIZE={MAX_TTS_CACHE_SIZE}")
-logger.info(f"环境配置: OpenAI API Base={os.getenv('OPENAI_API_BASE')}")
-logger.info(f"环境配置: OpenAI Model={os.getenv('OPENAI_MODEL')}")
-logger.info(f"环境配置: TTS API Base={os.getenv('TTS_API_BASE')}")
-logger.info(f"环境配置: TTS Model={os.getenv('TTS_API_MODEL')}")
+# 启用CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# 确保音频目录存在
-os.makedirs(AUDIO_PATH, exist_ok=True)
-logger.info(f"确保音频目录存在: {AUDIO_PATH}")
 
-# 挂载静态文件目录
-app.mount("/audio", StaticFiles(directory=AUDIO_PATH), name="audio")
-logger.info(f"静态文件目录已挂载: /audio -> {AUDIO_PATH}")
-
-# 用于存储任务状态和音频队列
-tasks = {}
-
-# TTS缓存，用于存储已转换的文本音频结果
-tts_cache = {}
-
-# 流量控制信号量
-tts_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TTS)
-
-class TextRequest(BaseModel):
-    text: str
-
-class AudioResponse(BaseModel):
-    task_id: str
-    audio_url: Optional[str] = None
-    status: str = "processing"
-
-def calculate_text_hash(text: str) -> str:
-    """计算文本的哈希值，用于TTS缓存"""
-    return hashlib.md5(text.encode('utf-8')).hexdigest()
-
-def manage_tts_cache():
-    """管理TTS缓存大小，删除最旧的条目"""
-    global tts_cache
-    if len(tts_cache) > MAX_TTS_CACHE_SIZE:
-        # 按访问时间排序，删除最旧的条目
-        sorted_cache = sorted(tts_cache.items(), key=lambda x: x[1]['last_access'])
-        # 删除超出限制的旧条目
-        for key, _ in sorted_cache[:len(tts_cache) - MAX_TTS_CACHE_SIZE]:
-            del tts_cache[key]
-        logger.info(f"TTS缓存清理完成，当前缓存大小: {len(tts_cache)}")
-
-def split_text_into_segments(text, min_length=20, max_length=100):
-    """智能分段文本，优先在句号等标点处断开"""
-    if len(text) < min_length:
-        return []
+# 全局状态管理
+class TaskManager:
+    def __init__(self):
+        self.tasks: Dict[str, Dict] = {}
+        self.llm_queues: Dict[str, asyncio.Queue] = {}
+        self.audio_queues: Dict[str, asyncio.Queue] = {}
+        self.active_tasks: Set[str] = set()
         
-    segments = []
-    # 匹配句末标点
-    sentence_boundaries = [m.end() for m in re.finditer(r'[。.!?！？]', text)]
-    
-    start = 0
-    for end in sentence_boundaries:
-        # 如果这个句子足够长，就切分出来
-        if end - start >= min_length:
-            segments.append(text[start:end])
-            start = end
-        # 如果积累的内容已经很长，即使没到句号也切分
-        elif end - start > max_length:
-            segments.append(text[start:end])
-            start = end
-    
-    # 保留剩余部分
-    remaining = text[start:]
-    if remaining:
-        if len(remaining) >= min_length:
-            segments.append(remaining)
-        else:
-            # 返回剩余部分作为下一轮的开始
-            return segments + [remaining]
-            
-    return segments
-
-async def call_llm_with_sse(text):
-    """获取LLM的SSE响应"""
-    start_time = time.time()
-    logger.info(f"开始调用LLM生成内容，输入长度: {len(text)} 字符")
-    
-    baseurl = os.getenv("OPENAI_API_BASE")
-    api_key = os.getenv("OPENAI_API_KEY")
-    model = os.getenv("OPENAI_MODEL")
-    url = f"{baseurl}/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
-    }
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": text}],
-        "stream": True
-    }
-    
-    total_tokens = 0
-    try:
-        logger.debug(f"LLM请求URL: {url}, 模型: {model}")
-        async with httpx.AsyncClient() as client:
-            async with client.stream("POST", url, headers=headers, json=payload) as response:
-                if response.status_code != 200:
-                    error_detail = await response.read()
-                    logger.error(f"LLM请求失败，状态码: {response.status_code}, 错误: {error_detail}")
-                    return
-                
-                logger.info(f"LLM请求成功，开始接收流式响应")
-                # 解析每个chunk获取content内容
-                async for chunk in response.iter_lines():
-                    if not chunk:
-                        continue
-                    # 去掉"data: "前缀
-                    if chunk.startswith(b"data: "):
-                        chunk = chunk[6:]
-                    # 解析JSON获取content
-                    try:
-                        chunk_data = json.loads(chunk)
-                        if chunk_data["choices"][0]["delta"].get("content"):
-                            content = chunk_data["choices"][0]["delta"]["content"]
-                            total_tokens += 1
-                            yield content
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"JSON解析错误: {e}, chunk: {chunk[:100]}")
-                        continue
-                    except Exception as e:
-                        logger.error(f"处理LLM响应时出错: {e}")
-                        logger.debug(f"错误详情: {traceback.format_exc()}")
-                        continue
-    except Exception as e:
-        logger.error(f"LLM调用异常: {str(e)}")
-        logger.debug(f"错误详情: {traceback.format_exc()}")
-        
-    duration = time.time() - start_time
-    logger.info(f"LLM生成完成，总计: {total_tokens} 个token，耗时: {duration:.2f}秒")
-
-async def text_to_speech(text: str, task_id: str) -> str:
-    """调用TTS服务将文本转为语音，保存到共享卷并返回访问路径"""
-    # 检查缓存
-    text_hash = calculate_text_hash(text)
-    if text_hash in tts_cache:
-        cache_entry = tts_cache[text_hash]
-        # 更新访问时间
-        cache_entry['last_access'] = time.time()
-        logger.info(f"TTS缓存命中: {text_hash}, URL: {cache_entry['audio_url']}")
-        
-        # 记录音频文件路径到任务中
-        if task_id in tasks and "audio_files" in tasks[task_id]:
-            tasks[task_id]["audio_files"].add(cache_entry['file_path'])
-            logger.debug(f"已将缓存音频文件 {cache_entry['file_path']} 添加到任务 {task_id} 的文件列表中")
-        
-        return cache_entry['audio_url']
-    
-    # 使用信号量控制并发请求数
-    async with tts_semaphore:
-        start_time = time.time()
-        logger.info(f"开始TTS转换，文本长度: {len(text)} 字符, 文本开头: '{text[:30]}...'")
-        
-        baseurl = os.getenv("TTS_API_BASE")
-        api_key = os.getenv("TTS_API_KEY")
-        model = os.getenv("TTS_API_MODEL")
-        voice = f"{model}:alex"
-        
-        url = f"{baseurl}/audio/speech" 
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
+    def create_task(self, question: str) -> str:
+        task_id = str(uuid.uuid4())
+        self.tasks[task_id] = {
+            "question": question,
+            "status": "processing",
+            "created_at": time.time(),
+            "text_generated": "",
+            "audio_files": []
         }
+        self.llm_queues[task_id] = asyncio.Queue()
+        self.audio_queues[task_id] = asyncio.Queue()
+        self.active_tasks.add(task_id)
+        return task_id
+    
+    def get_task(self, task_id: str) -> Optional[Dict]:
+        return self.tasks.get(task_id)
+    
+    def update_task_status(self, task_id: str, status: str):
+        if task_id in self.tasks:
+            self.tasks[task_id]["status"] = status
+            
+    def add_audio_file(self, task_id: str, audio_file: str):
+        if task_id in self.tasks:
+            self.tasks[task_id]["audio_files"].append(audio_file)
+            
+    def cancel_task(self, task_id: str) -> bool:
+        if task_id in self.active_tasks:
+            self.active_tasks.remove(task_id)
+            self.update_task_status(task_id, "cancelled")
+            return True
+        return False
+
+# 初始化任务管理器
+task_manager = TaskManager()
+
+# 请求模型
+class GenerateRequest(BaseModel):
+    question: str
+
+class TaskIdRequest(BaseModel):
+    task_id: str
+
+# 模拟TTS服务
+async def text_to_speech(text: str, task_id: str, segment_id: int) -> str:
+    """
+    将文本转换为语音（使用Silicon Flow API）
+    """
+    # 记录TTS输入文本
+    logger.info(f"TTS Request [Task {task_id}] [Segment {segment_id}]: {text}")
+    
+    # 创建音频文件名并保存
+    filename = f"{AUDIO_FOLDER}/{task_id}_{segment_id}.wav"
+    
+    try:
+        # 配置API调用
+        url = os.getenv("TTS_API_BASE") + "/audio/speech"
         
-        # 根据TTS API文档，调整请求参数
+        # 准备请求参数
         payload = {
-            "model": model,
+            "model": os.getenv("TTS_API_MODEL"),
             "input": text,
-            "voice": voice,
+            "voice": os.getenv("TTS_API_VOICE"),
             "response_format": "wav",
             "sample_rate": 16000,  # 标准采样率
-            "stream": False,       # 非流式请求
-            "speed": 1,            # 正常语速
-            "gain": 0              # 默认增益
+            "stream": False,       # 整个文件返回而不是流式
+            "speed": 1,
+            "gain": 0
         }
         
-        logger.debug(f"TTS请求URL: {url}, 模型: {model}, 声音: {voice}")
+        # 准备请求头
+        headers = {
+            "Authorization": f"Bearer {os.getenv('TTS_API_KEY', '')}",
+            "Content-Type": "application/json"
+        }
         
-        try:
-            async with httpx.AsyncClient() as client:
-                # 设置超时时间
-                response = await client.post(url, headers=headers, json=payload, timeout=30.0)
-                
-                if response.status_code == 200:
-                    # 生成唯一的文件名
-                    filename = f"{uuid.uuid4()}.wav"
-                    file_path = os.path.join(AUDIO_PATH, filename)
-                    
-                    # 获取音频数据大小
-                    audio_data = response.content
-                    audio_size = len(audio_data)
-                    logger.info(f"TTS服务返回音频数据: {audio_size} 字节")
-                    
-                    # 保存音频数据到文件
-                    try:
-                        with open(file_path, "wb") as f:
-                            f.write(audio_data)
-                        logger.info(f"音频文件已保存: {file_path}, 大小: {audio_size} 字节")
-                    except Exception as e:
-                        logger.error(f"保存音频文件出错: {str(e)}, 路径: {file_path}")
-                        logger.debug(f"错误详情: {traceback.format_exc()}")
-                        return None
-                    
-                    # 返回客户端可访问的URL (基于挂载的静态文件路径)
-                    audio_url = f"{AUDIO_URL_PREFIX}/{filename}"
-                    logger.info(f"生成音频URL: {audio_url}")
-                    
-                    # 记录音频文件路径到任务中
-                    if task_id in tasks and "audio_files" in tasks[task_id]:
-                        tasks[task_id]["audio_files"].add(file_path)
-                        logger.debug(f"已将音频文件 {file_path} 添加到任务 {task_id} 的文件列表中")
-                    
-                    # 添加到缓存
-                    tts_cache[text_hash] = {
-                        'audio_url': audio_url,
-                        'file_path': file_path,
-                        'last_access': time.time()
-                    }
-                    # 管理缓存大小
-                    manage_tts_cache()
-                    
-                    duration = time.time() - start_time
-                    logger.info(f"TTS转换完成，文本: {len(text)} 字符 -> 音频: {audio_size} 字节, 耗时: {duration:.2f}秒")
-                    return audio_url
-                else:
-                    error_detail = response.text
-                    logger.error(f"TTS服务请求失败，状态码: {response.status_code}, 错误信息: {error_detail}")
-                    return None
-        except httpx.TimeoutException:
-            logger.error(f"TTS服务请求超时, URL: {url}")
-            return None
-        except Exception as e:
-            logger.error(f"TTS服务调用异常: {str(e)}")
-            logger.debug(f"错误详情: {traceback.format_exc()}")
-            return None
-
-async def wait_for_first_audio(task_id, max_iterations=300):  # 30秒(0.1秒 * 300)
-    """等待第一段音频生成完成"""
-    iterations = 0
-    while iterations < max_iterations:
-        if task_id not in tasks:
-            logger.error(f"任务 {task_id} 不存在")
-            return False
+        # 发送API请求
+        logger.info(f"Calling TTS API for task {task_id}, segment {segment_id}")
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload, headers=headers)
             
-        if tasks[task_id]["audio_queue"] or tasks[task_id]["completed"]:
-            return True
-            
-        await asyncio.sleep(0.1)
-        iterations += 1
+            # 检查响应状态
+            if response.status_code == 200:
+                # 将二进制响应保存到文件
+                with open(filename, 'wb') as f:
+                    f.write(response.content)
+                logger.info(f"TTS API success [Task {task_id}] [Segment {segment_id}]: Generated {filename}")
+            else:
+                # 如果API调用失败，记录错误并回退到模拟模式
+                logger.error(f"TTS API error [Task {task_id}]: {response.status_code} - {response.text}")
+                with open(filename, 'w') as f:
+                    f.write(f"TTS AUDIO CONTENT FOR: {text}")
         
-        if iterations % 50 == 0:  # 每5秒记录一次
-            logger.info(f"任务 {task_id}: 等待第一段音频，已等待 {iterations/10:.1f} 秒")
+    except Exception as e:
+        # 出现异常时，回退到模拟模式
+        logger.exception(f"TTS processing error [Task {task_id}]: {str(e)}")
+        with open(filename, 'w') as f:
+            f.write(f"TTS AUDIO CONTENT FOR: {text}")
     
-    logger.warning(f"任务 {task_id}: 等待第一段音频超时，最大等待时间已到")
-    return False
+    return filename
 
-async def cleanup_task(task_id: str):
-    """清理任务及其关联的音频文件"""
-    logger.info(f"计划任务清理: {task_id}, 延迟: {TASK_CLEANUP_DELAY}秒后执行")
+# 处理LLM生成和TTS转换的后台任务
+async def process_llm_response(task_id: str):
+    """处理来自LLM的响应并管理TTS转换流程"""
     
-    # 等待指定的延迟时间
-    await asyncio.sleep(TASK_CLEANUP_DELAY)
+    if task_id not in task_manager.tasks:
+        logger.warning(f"Task {task_id} not found in task manager")
+        return
     
-    logger.info(f"开始执行任务清理: {task_id}")
+    question = task_manager.tasks[task_id]["question"]
+    llm_queue = task_manager.llm_queues[task_id]
+    audio_queue = task_manager.audio_queues[task_id]
     
-    if task_id in tasks:
-        # 获取不在缓存中的音频文件
-        audio_files = tasks[task_id].get("audio_files", set())
-        files_to_delete = set()
-        
-        for file_path in audio_files:
-            # 检查文件是否被缓存引用
-            is_cached = False
-            for cache_entry in tts_cache.values():
-                if cache_entry['file_path'] == file_path:
-                    is_cached = True
-                    break
-            
-            if not is_cached:
-                files_to_delete.add(file_path)
-        
-        logger.info(f"任务 {task_id} 关联的音频文件: {len(audio_files)}个, 将删除: {len(files_to_delete)}个")
-        
-        deleted_count = 0
-        error_count = 0
-        
-        for file_path in files_to_delete:
-            try:
-                if os.path.exists(file_path):
-                    file_size = os.path.getsize(file_path)
-                    os.remove(file_path)
-                    logger.info(f"已删除音频文件: {file_path}, 大小: {file_size} 字节")
-                    deleted_count += 1
-                else:
-                    logger.warning(f"音频文件不存在，无需删除: {file_path}")
-            except Exception as e:
-                logger.error(f"删除音频文件出错: {file_path}, 错误: {str(e)}")
-                logger.debug(f"错误详情: {traceback.format_exc()}")
-                error_count += 1
-        
-        # 记录任务数据
-        creation_time = tasks[task_id].get("creation_time", 0)
-        completion_time = tasks[task_id].get("completion_time", 0)
-        task_duration = completion_time - creation_time if completion_time > 0 else 0
-        
-        # 从任务字典中删除任务数据
-        del tasks[task_id]
-        logger.info(f"任务数据已清理: {task_id}, 任务运行时长: {task_duration:.2f}秒, 删除文件: {deleted_count}个成功, {error_count}个失败")
-    else:
-        logger.warning(f"任务 {task_id} 不存在或已被清理")
-
-async def process_llm_response(task_id: str, text: str):
-    """处理LLM响应并转换为音频流"""
-    logger.info(f"开始处理任务 {task_id}，输入文本长度: {len(text)} 字符")
-    start_time = time.time()
-    
-    buffer = ""
-    chunk_count = 0
-    audio_count = 0
+    logger.info(f"Starting LLM processing for task {task_id}")
+    logger.info(f"Question: {question}")
     
     try:
-        async for chunk in call_llm_with_sse(text):
-            buffer += chunk
-            chunk_count += 1
+        async with httpx.AsyncClient(base_url=OPENAI_BASE_URL, headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}) as client:
+            payload = {
+                "model": os.getenv("OPENAI_MODEL"),
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": question}
+                ],
+                "stream": True
+            }
             
-            # 使用智能分段逻辑
-            segments = split_text_into_segments(buffer)
-            if segments:
-                # 保留最后一段不完整的文本
-                buffer = segments.pop() if segments else ""
+            # 调用OpenAI API获取流式响应
+            logger.info(f"Calling OpenAI API for task {task_id}")
+            # 添加调试信息
+            logger.debug(f"Payload: {payload}")
+            async with client.stream("POST", "/chat/completions", json=payload) as response:
+                buffer = ""
+                segment_id = 0
+                is_first_segment = True  # 标记是否为第一个片段
+                json_buffer = ""  # 用于累积不完整的JSON数据
                 
-                # 并行处理完整段落的TTS转换
-                if segments:
-                    tts_tasks = [text_to_speech(segment, task_id) for segment in segments]
-                    audio_urls = await asyncio.gather(*tts_tasks)
+                async for chunk in response.aiter_text():
+                    # 确保任务没有被取消
+                    if task_id not in task_manager.active_tasks:
+                        logger.info(f"Task {task_id} was cancelled, stopping LLM processing")
+                        break
                     
-                    for url in audio_urls:
-                        if url:
-                            tasks[task_id]["audio_queue"].append(url)
-                            audio_count += 1
-                            logger.info(f"任务 {task_id}: 已生成音频 #{audio_count}, 添加到队列, URL: {url}")
-                        else:
-                            logger.warning(f"任务 {task_id}: 音频生成失败，跳过一段文本")
-        
-        # 处理剩余的文本
-        if buffer:
-            logger.debug(f"任务 {task_id}: 处理最后一段文本 ({len(buffer)} 字符)")
-            audio_url = await text_to_speech(buffer, task_id)
-            if audio_url:
-                tasks[task_id]["audio_queue"].append(audio_url)
-                audio_count += 1
-                logger.info(f"任务 {task_id}: 已生成最后一段音频 #{audio_count}, 添加到队列, URL: {audio_url}")
-            else:
-                logger.warning(f"任务 {task_id}: 最后一段音频生成失败，文本: {buffer[:50]}...")
+                    # 解析每个数据块
+                    if chunk.strip():
+                        # 处理数据块，可能包含多个data:行或不完整的JSON
+                        chunk_lines = chunk.strip().split('\n')
+                        
+                        for line in chunk_lines:
+                            line = line.strip()
+                            if not line:
+                                continue
+                                
+                            # 处理data:前缀
+                            if line.startswith("data: "):
+                                line = line[6:]
+                            
+                            # 跳过[DONE]消息
+                            if line == "[DONE]":
+                                logger.debug(f"Received [DONE] for task {task_id}")
+                                continue
+                            
+                            # 累积JSON数据
+                            json_buffer += line
+                            
+                            # 尝试解析累积的JSON
+                            try:
+                                data = json.loads(json_buffer)
+                                # 成功解析后重置缓冲区
+                                json_buffer = ""
+                                
+                                # 处理解析后的数据
+                                if "choices" in data and len(data["choices"]) > 0:
+                                    if "delta" in data["choices"][0] and "content" in data["choices"][0]["delta"]:
+                                        text = data["choices"][0]["delta"]["content"]
+                                        buffer += text
+                                        task_manager.tasks[task_id]["text_generated"] += text
+                                        
+                                        # 记录LLM输出
+                                        logger.debug(f"LLM Output [Task {task_id}]: '{text}'")
+                                        
+                                        # 放入LLM队列供其他函数处理
+                                        await llm_queue.put(text)
+                                        
+                                        # 为第一个片段的特殊处理
+                                        if is_first_segment:
+                                            # 检查是否包含任何标点符号(逗号、句号、问号、感叹号等)
+                                            punctuation_marks = "，。？！；：、,.?!;:"
+                                            has_punctuation = any(mark in buffer for mark in punctuation_marks)
+                                            
+                                            if (len(buffer) >= 5 and has_punctuation) or len(buffer) >= 30:
+                                                # 如果包含标点符号且至少有5个字符，或者达到15字符上限
+                                                logger.info(f"First segment threshold reached for task {task_id}, sending to TTS: {len(buffer)} chars")
+                                                
+                                                # 找出第一个标点符号的位置
+                                                cut_position = len(buffer)
+                                                for mark in punctuation_marks:
+                                                    pos = buffer.find(mark)
+                                                    if pos > 0 and pos < cut_position:
+                                                        cut_position = pos + 1
+                                                
+                                                # 如果没找到标点或字数不够，强制截断
+                                                if cut_position == len(buffer) and len(buffer) < 5:
+                                                    continue  # 继续等待更多文本
+                                                
+                                                # 分割文本
+                                                text_to_convert = buffer[:cut_position]
+                                                buffer = buffer[cut_position:]
+                                                
+                                                # 生成音频文件
+                                                audio_file = await text_to_speech(text_to_convert, task_id, segment_id)
+                                                segment_id += 1
+                                                
+                                                # 添加到任务信息并放入音频队列
+                                                task_manager.add_audio_file(task_id, audio_file)
+                                                await audio_queue.put(audio_file)
+                                                
+                                                # 标记第一个片段已处理
+                                                is_first_segment = False
+                                                logger.info(f"First segment processed: '{text_to_convert}'")
+                                        else:
+                                            # 普通片段处理逻辑
+                                            # 检查缓冲区是否达到阈值且包含完整句子
+                                            if len(buffer) >= MIN_CHARS_FOR_TTS and "。" in buffer:
+                                                # 找到最后一个句号
+                                                last_period = buffer.rindex("。") + 1
+                                                text_to_convert = buffer[:last_period]
+                                                buffer = buffer[last_period:]
+                                                
+                                                logger.info(f"Buffer threshold reached for task {task_id}, sending to TTS: {len(text_to_convert)} chars")
+                                                
+                                                # 生成音频文件
+                                                audio_file = await text_to_speech(text_to_convert, task_id, segment_id)
+                                                segment_id += 1
+                                                
+                                                # 添加到任务信息并放入音频队列
+                                                task_manager.add_audio_file(task_id, audio_file)
+                                                await audio_queue.put(audio_file)
+                            except json.JSONDecodeError:
+                                # JSON不完整，继续等待更多数据
+                                # 如果累积的数据过长但仍无法解析，可能是格式错误，此时重置缓冲区
+                                if len(json_buffer) > 10000:  # 设置合理的上限
+                                    logger.warning(f"JSON buffer overflow for task {task_id}, resetting buffer")
+                                    json_buffer = ""
+                                continue
+                
+                # 处理剩余文本
+                if buffer and task_id in task_manager.active_tasks:
+                    logger.info(f"Processing remaining buffer for task {task_id}: {len(buffer)} chars")
+                    audio_file = await text_to_speech(buffer, task_id, segment_id)
+                    task_manager.add_audio_file(task_id, audio_file)
+                    await audio_queue.put(audio_file)
+                
+                # 标记任务完成
+                if task_id in task_manager.active_tasks:
+                    logger.info(f"Task {task_id} completed successfully")
+                    await audio_queue.put("TTSDONE")
+                    task_manager.update_task_status(task_id, "completed")
+                    
     except Exception as e:
-        logger.error(f"任务 {task_id} 处理异常: {str(e)}")
-        logger.debug(f"错误详情: {traceback.format_exc()}")
-        tasks[task_id]["error"] = str(e)
+        # 处理错误
+        logger.exception(f"Error processing task {task_id}: {str(e)}")
+        task_manager.update_task_status(task_id, "error")
+        await audio_queue.put("TTSDONE")
+        
     finally:
-        # 标记任务完成
-        tasks[task_id]["completed"] = True
-        tasks[task_id]["completion_time"] = time.time()
-        duration = tasks[task_id]["completion_time"] - start_time
-        
-        logger.info(f"任务 {task_id} 处理完成: 处理了 {chunk_count} 个文本块, 生成了 {audio_count} 个音频文件, 耗时: {duration:.2f}秒")
-        
-        # 在后台启动清理任务
-        asyncio.create_task(cleanup_task(task_id))
+        # 清理工作
+        if task_id in task_manager.active_tasks:
+            task_manager.active_tasks.remove(task_id)
+            logger.info(f"Removed task {task_id} from active tasks")
+
+# API 端点
+@app.get("/")
+async def root():
+    """返回首页HTML"""
+    return FileResponse("index.html")
 
 @app.post("/generate_audio")
-async def generate_audio(request: TextRequest, background_tasks: BackgroundTasks):
-    """接收文本并开始生成音频流程"""
-    start_time = time.time()
-    task_id = str(uuid.uuid4())
+async def generate_audio(request: GenerateRequest, background_tasks: BackgroundTasks):
+    """
+    生成音频端点 - 启动LLM处理并返回任务ID
+    """
+    task_id = task_manager.create_task(request.question)
+    logger.info(f"Created new task {task_id} for question: {request.question}")
     
-    logger.info(f"收到新请求，创建任务 {task_id}, 输入文本长度: {len(request.text)} 字符")
-    logger.debug(f"任务 {task_id} 输入文本: '{request.text[:100]}...'")
+    # 启动后台任务处理LLM响应
+    background_tasks.add_task(process_llm_response, task_id)
     
-    tasks[task_id] = {
-        "audio_queue": [],
-        "audio_files": set(),  # 存储音频文件路径，用于后续清理
-        "completed": False,
-        "creation_time": start_time
-    }
-    
-    # 后台启动处理任务
-    background_tasks.add_task(process_llm_response, task_id, request.text)
-    logger.info(f"已启动任务 {task_id} 的后台处理")
-    
-    # 等待第一段音频生成完毕，设置超时
-    try:
-        await asyncio.wait_for(
-            wait_for_first_audio(task_id),
-            timeout=30.0  # 最大等待30秒
-        )
-    except asyncio.TimeoutError:
-        logger.error(f"任务 {task_id}: 等待首段音频生成超时")
-    
-    # 返回第一段音频和任务ID
-    first_audio = tasks[task_id]["audio_queue"].pop(0) if tasks[task_id]["audio_queue"] else None
-    is_completed = tasks[task_id]["completed"] and not tasks[task_id]["audio_queue"]
-    
-    response_data = {
+    return JSONResponse({
         "task_id": task_id,
-        "audio_url": first_audio,
-        "status": "completed" if is_completed else "processing"
-    }
-    
-    total_duration = time.time() - start_time
-    logger.info(f"任务 {task_id}: 首次响应完成，状态: {response_data['status']}, 音频URL: {first_audio}, 总耗时: {total_duration:.2f}秒")
-    
-    return JSONResponse(response_data)
+        "status": "processing",
+        "message": "Audio generation started"
+    })
 
 @app.get("/get_next_audio/{task_id}")
 async def get_next_audio(task_id: str):
-    """获取下一段音频"""
-    start_time = time.time()
-    logger.info(f"收到获取下一段音频请求，任务ID: {task_id}")
+    """
+    获取下一个音频段落
+    """
+    if task_id not in task_manager.tasks:
+        logger.warning(f"Attempt to get audio for non-existent task {task_id}")
+        raise HTTPException(status_code=404, detail="Task not found")
     
-    if task_id not in tasks:
-        logger.warning(f"无效的任务ID: {task_id}")
-        return JSONResponse({"error": "Invalid task ID"}, status_code=404)
+    logger.info(f"Request for next audio segment for task {task_id}")
+    audio_queue = task_manager.audio_queues[task_id]
     
-    # 检查队列中是否有音频
-    if tasks[task_id]["audio_queue"]:
-        next_audio = tasks[task_id]["audio_queue"].pop(0)
-        queue_length = len(tasks[task_id]["audio_queue"])
+    try:
+        # 等待最多5秒来获取下一个音频文件
+        next_audio = await asyncio.wait_for(audio_queue.get(), timeout=5.0)
         
-        response_data = {
-            "task_id": task_id,
-            "audio_url": next_audio,
-            "status": "processing",
-            "queue_length": queue_length  # 返回当前队列长度信息
-        }
-        
-        logger.info(f"任务 {task_id}: 返回下一段音频，URL: {next_audio}, 剩余队列: {queue_length}")
-        return JSONResponse(response_data)
-    
-    # 如果队列为空且任务已完成
-    if tasks[task_id]["completed"]:
-        logger.info(f"任务 {task_id}: 已完成，无更多音频")
-        return JSONResponse({
-            "task_id": task_id,
-            "audio_url": None,
-            "status": "TTSDONE"
-        })
-    
-    # 队列为空但任务仍在处理中
-    logger.info(f"任务 {task_id}: 队列暂时为空，任务处理中")
-    return JSONResponse({
-        "task_id": task_id,
-        "audio_url": None,
-        "status": "waiting"
-    })
+        # 检查是否完成
+        if next_audio == "TTSDONE":
+            logger.info(f"All audio segments for task {task_id} have been generated")
+            return JSONResponse({
+                "status": "completed",
+                "message": "All audio segments generated"
+            })
+            
+        logger.info(f"Returning audio file for task {task_id}: {next_audio}")
+        return FileResponse(
+            path=next_audio,
+            headers={
+                "Content-Disposition": f"attachment; filename={os.path.basename(next_audio)}"
+            }
+        )
+    except asyncio.TimeoutError:
+        # 队列为空但任务可能仍在处理中
+        if task_id in task_manager.active_tasks:
+            logger.info(f"No audio ready yet for task {task_id}, still processing")
+            return JSONResponse({
+                "status": "pending",
+                "message": "No audio ready yet, try again later"
+            })
+        else:
+            # 任务已完成且队列为空
+            logger.info(f"Task {task_id} completed with no more audio segments")
+            return JSONResponse({
+                "status": "completed",
+                "message": "All audio segments generated"
+            })
+    except Exception as e:
+        logger.exception(f"Error getting next audio for task {task_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error getting next audio: {str(e)}")
 
-@app.get("/status")
-async def get_status():
-    """获取服务器状态信息"""
+@app.get("/status/{task_id}")
+async def status(task_id: str):
+    """
+    获取任务状态
+    """
+    task = task_manager.get_task(task_id)
+    if not task:
+        logger.warning(f"Status check for non-existent task {task_id}")
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    logger.info(f"Status request for task {task_id}: {task['status']}")
     return {
-        "active_tasks": len(tasks),
-        "tts_cache_size": len(tts_cache),
-        "tts_semaphore": tts_semaphore._value,  # 当前可用的信号量数量
+        "task_id": task_id,
+        "status": task["status"],
+        "created_at": task["created_at"],
+        "audio_segments": len(task["audio_files"]),
+        "is_active": task_id in task_manager.active_tasks
     }
 
+@app.post("/cancel_task_by_id")
+async def cancel_task_by_id(request: TaskIdRequest):
+    """
+    取消指定任务
+    """
+    success = task_manager.cancel_task(request.task_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Task not found or already completed")
+    
+    return {"status": "success", "message": f"Task {request.task_id} cancelled"}
+
+# 确保日志目录存在
+os.makedirs("logs", exist_ok=True)
+
+# 主入口点
 if __name__ == "__main__":
     import uvicorn
-    
-    logger.info("======= 启动服务器 =======")
-    
-    # 启动FastAPI应用
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8009,
-        reload=True,
-        log_level="info"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8009)
